@@ -1,9 +1,0 @@
-#!/bin/bash
-
-# Small delay to ensure X is ready
-sleep 1
-xbindkeys
-pactl set-sink-volume @DEFAULT_SINK@ 65%
-mpv --fs --panscan=1 ~/Desktop/startup.webm
-
-flatpak run org.pegasus_frontend.Pegasus

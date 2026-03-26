@@ -1,0 +1,5 @@
+polkit.addRule(function(action, subject) {
+  if (action.lookup("program") == "/usr/bin/nvpmodel" && subject.isInGroup("wheel")) {
+    return polkit.Result.YES;
+  }
+});

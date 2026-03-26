@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Quick Access Menu - Steam Deck styled with touch support
-Fixed: Lock file based instance detection
 """
 
 import tkinter as tk

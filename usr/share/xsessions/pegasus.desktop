@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Gaming Mode
+Comment=Starts Pegasus frontend
+Exec=/usr/bin/pegasus-launcher
+TryExec=/usr/bin/pegasus-launcher
+Icon=nintendeck
+Type=Application

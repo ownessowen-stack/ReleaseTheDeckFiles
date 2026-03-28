@@ -1,0 +1,7 @@
+#/bin/bash
+openbox-session &
+sleep 1
+xbindkeys &
+mpv --fs --panscan=1 /usr/share/animations/startup.webm
+onboard &
+flatpak run org.pegasus_frontend.Pegasus

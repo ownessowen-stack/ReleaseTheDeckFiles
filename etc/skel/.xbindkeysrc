@@ -32,7 +32,7 @@
 # By defaults, xbindkeys does not pay attention with the modifiers
 # NumLock, CapsLock and ScrollLock.
 # Uncomment the lines above if you want to pay attention to them.
-
+https://github.com/ownessowen-stack/ReleaseTheDeckFiles/blob/main/etc/skel/.xbindkeysrc
 #keystate_numlock = enable
 #keystate_capslock = enable
 #keystate_scrolllock= enable
@@ -43,10 +43,10 @@
     XF86AudioLowerVolume
 
 "pactl set-sink-volume @DEFAULT_SINK@ +10%"
-  XF86AudioRaiseVolume
+    XF86AudioRaiseVolume
 
-"/usr/local/bin/quick-access"
-    XF86Launch3
+"/usr/bin/quick-access"
+    XF86Launch0
 # set directly keycode (here control + f with my keyboard)
 #"xterm"
 #  c:41 + m:0x4

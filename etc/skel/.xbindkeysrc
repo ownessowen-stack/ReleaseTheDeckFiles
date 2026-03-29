@@ -46,7 +46,7 @@
   XF86AudioRaiseVolume
 
 "/usr/local/bin/quick-access"
-    F7
+    XF86Launch3
 # set directly keycode (here control + f with my keyboard)
 #"xterm"
 #  c:41 + m:0x4

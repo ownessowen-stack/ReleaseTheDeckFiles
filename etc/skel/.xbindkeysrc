@@ -47,6 +47,9 @@ https://github.com/ownessowen-stack/ReleaseTheDeckFiles/blob/main/etc/skel/.xbin
 
 "/usr/bin/quick-access"
     XF86Launch1
+
+"/usr/bin/open-onboard.sh"
+    Xf86Launch9
 # set directly keycode (here control + f with my keyboard)
 #"xterm"
 #  c:41 + m:0x4

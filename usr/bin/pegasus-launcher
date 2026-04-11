@@ -1,7 +1,5 @@
 #/bin/bash
 openbox-session &
-sleep 1
-mpv --fs --panscan=1 /usr/share/animations/startup.webm
+mpv --fs --no-input-default-bindings --no-osc --no-osd-bar --osd-level=0 --cursor-autohide=always --panscan=1 --no-border --really-quiet /usr/share/animations/startup.webm
 xbindkeys &
-onboard &
 flatpak run org.pegasus_frontend.Pegasus

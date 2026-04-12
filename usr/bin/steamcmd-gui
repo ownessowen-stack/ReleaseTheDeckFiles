@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+NintenDeck SteamCMD GUI – Steam Deck style with Joy‑Con red/blue accents
+- Dark theme, rounded widgets, touch‑friendly
+- Unified 4‑stage progress bar (preallocating, downloading, verifying, committing)
+- Persistent Steam session + crash recovery
+- Hideable log output
+"""
+
+import os
+import subprocess
+import threading
+import shutil
+import tarfile
+import zipfile
+import webbrowser
+from pathlib import Path
+
+import requests
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+
+# ========== Constants ==========
+STEAM_DIR = os.path.expanduser("~/SteamGames")
+GOLDBERG_DIR = os.path.expanduser("~/.local/share/goldberg")
+STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+GOLDBERG_URL = "https://gitlab.com/Mr_Goldberg/goldberg_emulator/-/jobs/4247811310/artifacts/download"
+API_KEY_FILE = os.path.join(STEAM_DIR, ".api_key")
+CRED_FILE = os.path.join(STEAM_DIR, ".credentials")
+
+# ========== Setup Helpers ==========
+def setup_directories():
+    os.makedirs(STEAM_DIR, exist_ok=True)
+    os.makedirs(GOLDBERG_DIR, exist_ok=True)
+
+def ensure_steamcmd():
+    steamcmd_sh = os.path.join(STEAM_DIR, "steamcmd.sh")
+    if os.path.exists(steamcmd_sh):
+        return True
+    try:
+        resp = requests.get(STEAMCMD_URL, stream=True)
+        resp.raise_for_status()
+        tar_path = os.path.join(STEAM_DIR, "steamcmd.tar.gz")
+        with open(tar_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        with tarfile.open(tar_path, "r:gz") as tar:
+            tar.extractall(STEAM_DIR)
+        os.remove(tar_path)
+        os.chmod(steamcmd_sh, 0o755)
+        return True
+    except Exception as e:
+        messagebox.showerror("Setup Error", f"Failed to download steamcmd:\n{e}")
+        return False
+
+def ensure_goldberg():
+    if os.path.exists(GOLDBERG_DIR) and os.listdir(GOLDBERG_DIR):
+        return True
+    try:
+        resp = requests.get(GOLDBERG_URL, stream=True)
+        resp.raise_for_status()
+        zip_path = os.path.join(STEAM_DIR, "goldberg.zip")
+        with open(zip_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(GOLDBERG_DIR)
+        os.remove(zip_path)
+        return True
+    except Exception as e:
+        messagebox.showerror("Setup Error", f"Failed to download Goldberg Emulator:\n{e}")
+        return False
+
+def get_game_id(game_name, api_key, log_callback=None):
+    if game_name.isdigit():
+        return game_name, None
+    base_url = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
+    params = {"key": api_key, "max_results": 50000}
+    last_appid = None
+    while True:
+        try:
+            resp = requests.get(base_url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            apps = data.get("response", {}).get("apps", [])
+            for app in apps:
+                if app.get("name") == game_name:
+                    return str(app["appid"]), None
+            if not apps:
+                break
+            last_appid = apps[-1]["appid"]
+            params["last_appid"] = last_appid
+            if log_callback:
+                log_callback(f"Searching next page, last ID: {last_appid}\n")
+        except Exception as e:
+            return None, f"API error: {e}"
+    return None, f"Game '{game_name}' not found."
+
+def establish_steam_session(username, password, code, log_callback):
+    cmd = [os.path.join(STEAM_DIR, "steamcmd.sh"),
+           "+login", username, password]
+    if code:
+        cmd.append(code)
+    cmd.append("+quit")
+    log_callback("🔐 Establishing persistent session (approve on phone if asked)...\n")
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1)
+    output_lines = []
+    for line in iter(process.stdout.readline, ""):
+        line = line.strip()
+        if line:
+            log_callback(line + "\n")
+            output_lines.append(line)
+    process.wait()
+    output = " ".join(output_lines)
+    if "Login Failure" in output or "Invalid password" in output:
+        return False
+    if "Steam Guard" in output and "code" in output.lower():
+        return False
+    return process.returncode == 0
+
+def download_game(app_id, game_name, username, log_callback, progress_callback, stage_callback):
+    script_path = os.path.join(STEAM_DIR, f"{app_id}.txt")
+    game_path = os.path.join(STEAM_DIR, game_name)
+
+    with open(script_path, "w") as f:
+        f.write(f"""@ShutdownOnFailedCommand 0
+@NoPromptForPassword 1
+force_install_dir "{game_path}"
+login {username}
+app_update {app_id} validate
+quit
+""")
+
+    stage_map = {
+        "preallocating": 0,
+        "downloading": 1,
+        "verifying": 2,
+        "committing": 3
+    }
+    current_stage_idx = -1
+    last_progress = 0
+    success = False
+    max_retries = 5
+    retry_count = 0
+
+    while retry_count <= max_retries and not success:
+        if retry_count > 0:
+            log_callback(f"\n⚠️ SteamCMD crashed (attempt {retry_count}). Checking existing files...\n")
+            progress_callback(10)
+            stage_callback("Recovering...")
+
+        cmd = [os.path.join(STEAM_DIR, "steamcmd.sh"), "+runscript", script_path]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1)
+
+        crashed = False
+        local_percent = 0.0
+
+        for line in iter(process.stdout.readline, ""):
+            line = line.strip()
+            if not line:
+                continue
+            log_callback(line + "\n")
+
+            if any(x in line for x in ["Segmentation fault", "Aborted", "core dumped"]):
+                crashed = True
+                log_callback("Detected crash – checking game files...\n")
+
+            line_lower = line.lower()
+            for stage_key, idx in stage_map.items():
+                if stage_key in line_lower:
+                    if idx != current_stage_idx:
+                        current_stage_idx = idx
+                        stage_callback(stage_key.capitalize())
+                        progress_callback(idx * 25)
+                    break
+
+            if "progress:" in line:
+                try:
+                    percent_str = line.split("progress:")[1].split()[0].strip()
+                    local_percent = float(percent_str)
+                except:
+                    pass
+            elif "preallocating" in line_lower and "%" in line:
+                try:
+                    percent_str = line.split("%")[0].split()[-1]
+                    local_percent = float(percent_str)
+                except:
+                    pass
+
+            if current_stage_idx >= 0:
+                base = current_stage_idx * 25
+                if current_stage_idx in [0,1,2,3]:
+                    overall = base + (local_percent / 100.0) * 25
+                else:
+                    overall = base
+                overall = min(100, max(0, overall))
+                if abs(overall - last_progress) > 0.5:
+                    last_progress = overall
+                    progress_callback(overall)
+
+            if "Success. App" in line and "'fully installed'" in line:
+                log_callback("✅ SteamCMD reports success.\n")
+                progress_callback(100)
+                stage_callback("Complete")
+                success = True
+                break
+
+        process.wait()
+        if success:
+            break
+
+        if crashed or process.returncode != 0:
+            game_executable = None
+            for root, dirs, files in os.walk(game_path):
+                for file in files:
+                    if file.lower().endswith((".exe", ".x86_64", ".x86", ".bin", ".sh")):
+                        game_executable = os.path.join(root, file)
+                        break
+                if game_executable:
+                    break
+            manifests = list(Path(game_path).glob("*.manifest"))
+            if game_executable or len(manifests) > 0 or last_progress > 90:
+                log_callback(f"\n🎮 Game appears complete (progress {last_progress:.1f}%)\n")
+                progress_callback(100)
+                stage_callback("Complete (files OK)")
+                success = True
+                break
+            else:
+                retry_count += 1
+                if retry_count > max_retries:
+                    log_callback(f"\n❌ Crashed {max_retries} times, no game files. Giving up.\n")
+                    return False
+                log_callback(f"Retrying ({retry_count}/{max_retries})...\n")
+                continue
+        else:
+            log_callback("SteamCMD exited without success message.\n")
+            return False
+
+    os.remove(script_path)
+    return success
+
+def remove_drm(game_folder, log_callback):
+    game_path = os.path.join(STEAM_DIR, game_folder)
+    goldberg_linux = os.path.join(GOLDBERG_DIR, "linux")
+    goldberg_windows = GOLDBERG_DIR
+    for root, dirs, files in os.walk(game_path):
+        for file in files:
+            if not (file.startswith("steam_api") or file == "steamclient.so"):
+                continue
+            full_path = os.path.join(root, file)
+            try:
+                file_info = subprocess.check_output(["file", "-b", full_path], text=True)
+            except:
+                continue
+            if "x86-64" in file_info:
+                arch = "x86_64"
+            elif "Intel i386" in file_info or "80386" in file_info:
+                arch = "x86"
+            else:
+                continue
+            if file == "steamclient.so":
+                src = os.path.join(goldberg_linux, arch, "steamclient.so")
+            elif file.endswith(".so"):
+                src = os.path.join(goldberg_linux, arch, "libsteam_api.so")
+            elif file.endswith(".dll"):
+                src = os.path.join(goldberg_windows, "steam_api64.dll" if arch == "x86_64" else "steam_api.dll")
+            else:
+                continue
+            if os.path.exists(src):
+                shutil.copy2(src, full_path)
+                log_callback(f"Replaced {full_path}\n")
+
+# ========== Custom Steam Deck Style ==========
+def setup_styles():
+    style = ttk.Style()
+    style.theme_use('clam')
+
+    # Colors
+    bg_dark = "#1E1E20"
+    bg_frame = "#2A2A2D"
+    fg_text = "#EEEEEE"
+    accent_red = "#E74C3C"
+    accent_blue = "#3498DB"
+    button_bg = "#3A3A3F"
+
+    # Configure root window
+    style.configure(".", background=bg_dark, foreground=fg_text, font=("Arial", 12))
+    style.configure("TNotebook", background=bg_dark, tabmargins=[0,5,0,0])
+    style.configure("TNotebook.Tab", background=bg_frame, foreground=fg_text, padding=[20,8], font=("Arial", 12, "bold"))
+    style.map("TNotebook.Tab", background=[("selected", accent_blue)])
+
+    style.configure("TFrame", background=bg_dark)
+    style.configure("TLabelframe", background=bg_frame, foreground=fg_text, font=("Arial", 11))
+    style.configure("TLabelframe.Label", background=bg_frame, foreground=fg_text)
+
+    style.configure("TLabel", background=bg_dark, foreground=fg_text, font=("Arial", 11))
+    style.configure("TButton", background=button_bg, foreground=fg_text, font=("Arial", 11, "bold"),
+                    borderwidth=0, focuscolor="none", padding=8)
+    style.map("TButton", background=[("active", accent_red), ("pressed", accent_blue)],
+              foreground=[("active", "white")])
+
+    style.configure("Accent.TButton", background=accent_red, foreground="white", font=("Arial", 13, "bold"), padding=12)
+    style.map("Accent.TButton", background=[("active", accent_blue)])
+
+    style.configure("TEntry", fieldbackground=bg_frame, foreground=fg_text, borderwidth=0, padding=6)
+    style.configure("TProgressbar", background=accent_red, troughcolor=bg_frame, bordercolor=bg_dark, lightcolor=accent_red, darkcolor=accent_red)
+
+    style.configure("Vertical.TScrollbar", background=bg_frame, troughcolor=bg_dark, arrowcolor=fg_text)
+    style.configure("TCheckbutton", background=bg_dark, foreground=fg_text, font=("Arial", 11))
+
+    return style
+
+# ========== GUI Application ==========
+class SteamGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("NintenDeck SteamCMD Tool")
+        self.geometry("1280x720")
+        self.minsize(800, 600)
+        self.configure(bg="#1E1E20")
+
+        setup_styles()
+        setup_directories()
+
+        self.api_key = self.load_api_key()
+        self.credentials = self.load_credentials()
+
+        # Main container
+        self.main_container = ttk.Frame(self)
+        self.main_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        self.notebook = ttk.Notebook(self.main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.download_tab = ttk.Frame(self.notebook)
+        self.links_tab = ttk.Frame(self.notebook)
+        self.about_tab = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.download_tab, text="🎮 Download Game")
+        self.notebook.add(self.links_tab, text="🔗 Compatibility")
+        self.notebook.add(self.about_tab, text="ℹ️ About")
+
+        self.setup_download_tab()
+        self.setup_links_tab()
+        self.setup_about_tab()
+
+        self.download_thread = None
+        self.log_visible = True
+
+    def load_api_key(self):
+        if os.path.exists(API_KEY_FILE):
+            with open(API_KEY_FILE) as f:
+                for line in f:
+                    if line.startswith("API_KEY="):
+                        return line.strip().split("=", 1)[1]
+        return ""
+
+    def save_api_key(self, key):
+        with open(API_KEY_FILE, "w") as f:
+            f.write(f"API_KEY={key}\n")
+        self.api_key = key
+
+    def load_credentials(self):
+        creds = {"username": "", "password": "", "steam_guard": False}
+        if os.path.exists(CRED_FILE):
+            with open(CRED_FILE) as f:
+                for line in f:
+                    if line.startswith("STEAM_USER="):
+                        creds["username"] = line.strip().split("=", 1)[1]
+                    elif line.startswith("STEAM_PASSWORD="):
+                        creds["password"] = line.strip().split("=", 1)[1]
+                    elif line.startswith("STEAM_GUARD="):
+                        creds["steam_guard"] = line.strip().split("=", 1)[1].lower() == "y"
+        return creds
+
+    def save_credentials(self, username, password, steam_guard):
+        with open(CRED_FILE, "w") as f:
+            f.write(f"STEAM_USER={username}\n")
+            f.write(f"STEAM_PASSWORD={password}\n")
+            f.write(f"STEAM_GUARD={'y' if steam_guard else 'n'}\n")
+        self.credentials = {"username": username, "password": password, "steam_guard": steam_guard}
+
+    def setup_download_tab(self):
+        main_frame = ttk.Frame(self.download_tab, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # API Key row
+        ttk.Label(main_frame, text="Steam API Key:", font=("Arial", 12)).grid(row=0, column=0, sticky=tk.W, pady=8)
+        self.api_entry = ttk.Entry(main_frame, width=45, font=("Arial", 11))
+        self.api_entry.insert(0, self.api_key)
+        self.api_entry.grid(row=0, column=1, sticky=tk.W, padx=10)
+        ttk.Button(main_frame, text="Save Key", command=self.save_api_key_gui).grid(row=0, column=2, padx=5)
+
+        # Game name/ID
+        ttk.Label(main_frame, text="Game Name or ID:", font=("Arial", 12)).grid(row=1, column=0, sticky=tk.W, pady=8)
+        self.game_entry = ttk.Entry(main_frame, width=45, font=("Arial", 11))
+        self.game_entry.grid(row=1, column=1, sticky=tk.W, padx=10)
+
+        # Steam username
+        ttk.Label(main_frame, text="Steam Username:", font=("Arial", 12)).grid(row=2, column=0, sticky=tk.W, pady=8)
+        self.user_entry = ttk.Entry(main_frame, width=30, font=("Arial", 11))
+        self.user_entry.insert(0, self.credentials["username"])
+        self.user_entry.grid(row=2, column=1, sticky=tk.W, padx=10)
+
+        # Steam password
+        ttk.Label(main_frame, text="Steam Password:", font=("Arial", 12)).grid(row=3, column=0, sticky=tk.W, pady=8)
+        self.pass_entry = ttk.Entry(main_frame, width=30, show="*", font=("Arial", 11))
+        self.pass_entry.insert(0, self.credentials["password"])
+        self.pass_entry.grid(row=3, column=1, sticky=tk.W, padx=10)
+
+        # Steam Guard toggle
+        self.guard_var = tk.BooleanVar(value=self.credentials["steam_guard"])
+        self.guard_check = ttk.Checkbutton(main_frame, text="Steam Guard Enabled", variable=self.guard_var,
+                                           command=self.toggle_guard_code)
+        self.guard_check.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=8)
+
+        # Steam Guard code
+        ttk.Label(main_frame, text="Steam Guard Code:", font=("Arial", 12)).grid(row=5, column=0, sticky=tk.W, pady=8)
+        self.code_entry = ttk.Entry(main_frame, width=20, font=("Arial", 11))
+        self.code_entry.grid(row=5, column=1, sticky=tk.W, padx=10)
+        self.code_entry.config(state="disabled")
+
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100, length=500, style="TProgressbar")
+        self.progress_bar.grid(row=6, column=0, columnspan=3, pady=15, sticky=tk.EW)
+
+        # Stage label
+        self.stage_label = ttk.Label(main_frame, text="Ready", font=("Arial", 13, "bold"))
+        self.stage_label.grid(row=7, column=0, columnspan=3, pady=5)
+
+        # Log toggle button
+        log_controls = ttk.Frame(main_frame)
+        log_controls.grid(row=8, column=0, columnspan=3, pady=10, sticky=tk.W)
+        self.toggle_log_btn = ttk.Button(log_controls, text="Hide Log", command=self.toggle_log)
+        self.toggle_log_btn.pack(side=tk.LEFT)
+
+        # Log area
+        self.log_frame = ttk.LabelFrame(main_frame, text="SteamCMD Output", padding=8)
+        self.log_frame.grid(row=9, column=0, columnspan=3, pady=10, sticky=tk.NSEW)
+        self.log_text = scrolledtext.ScrolledText(self.log_frame, height=10, wrap=tk.WORD,
+                                                  bg="#2A2A2D", fg="#EEEEEE", insertbackground="white",
+                                                  font=("Consolas", 10))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # Download button (big, accent)
+        self.download_btn = ttk.Button(main_frame, text="⬇️ DOWNLOAD GAME ⬇️", command=self.start_download,
+                                       style="Accent.TButton")
+        self.download_btn.grid(row=10, column=0, columnspan=3, pady=20)
+
+        # Grid weights
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(9, weight=1)
+
+    def toggle_log(self):
+        if self.log_visible:
+            self.log_frame.grid_remove()
+            self.toggle_log_btn.config(text="Show Log")
+            self.log_visible = False
+        else:
+            self.log_frame.grid()
+            self.toggle_log_btn.config(text="Hide Log")
+            self.log_visible = True
+
+    def toggle_guard_code(self):
+        self.code_entry.config(state="normal" if self.guard_var.get() else "disabled")
+        if not self.guard_var.get():
+            self.code_entry.delete(0, tk.END)
+
+    def save_api_key_gui(self):
+        key = self.api_entry.get().strip()
+        if key:
+            self.save_api_key(key)
+            messagebox.showinfo("Success", "API key saved.")
+        else:
+            messagebox.showwarning("Warning", "API key cannot be empty.")
+
+    def start_download(self):
+        if self.download_thread and self.download_thread.is_alive():
+            messagebox.showwarning("Busy", "Download already in progress.")
+            return
+        api_key = self.api_entry.get().strip()
+        if not api_key:
+            messagebox.showerror("Missing", "Enter and save your Steam API key.")
+            return
+        self.save_api_key(api_key)
+        game_input = self.game_entry.get().strip()
+        if not game_input:
+            messagebox.showerror("Missing", "Enter game name or ID.")
+            return
+        username = self.user_entry.get().strip()
+        password = self.pass_entry.get().strip()
+        if not username or not password:
+            messagebox.showerror("Missing", "Steam username and password required.")
+            return
+        steam_guard = self.guard_var.get()
+        code = self.code_entry.get().strip() if steam_guard else None
+        self.save_credentials(username, password, steam_guard)
+        self.log_text.delete(1.0, tk.END)
+        self.progress_var.set(0)
+        self.stage_label.config(text="Starting...")
+        self.download_btn.config(state=tk.DISABLED)
+        self.download_thread = threading.Thread(target=self.download_worker,
+                                                args=(api_key, game_input, username, password, code),
+                                                daemon=True)
+        self.download_thread.start()
+        self.after(100, self.check_thread)
+
+    def download_worker(self, api_key, game_input, username, password, code):
+        try:
+            if not ensure_steamcmd() or not ensure_goldberg():
+                self.queue_log("ERROR: Setup failed.\n")
+                return
+            app_id, error = get_game_id(game_input, api_key, self.queue_log)
+            if error:
+                self.queue_log(f"ERROR: {error}\n")
+                return
+            self.queue_log(f"App ID: {app_id}\n")
+            if code:
+                if not establish_steam_session(username, password, code, self.queue_log):
+                    self.queue_log("❌ Session setup failed.\n")
+                    return
+                self.queue_log("✅ Session saved.\n")
+            success = download_game(app_id, game_input, username, self.queue_log, self.queue_progress, self.queue_stage)
+            if not success:
+                self.queue_log("Download failed.\n")
+                return
+            self.queue_log("\nReplacing DRM libraries...\n")
+            remove_drm(game_input, self.queue_log)
+            self.queue_log("\n🎉 Game ready! 🎉\n")
+        except Exception as e:
+            self.queue_log(f"Unexpected error: {e}\n")
+        finally:
+            self.queue_download_finished()
+
+    def queue_log(self, msg):
+        self.after(0, lambda: self.log_text.insert(tk.END, msg))
+        self.after(0, lambda: self.log_text.see(tk.END))
+
+    def queue_progress(self, percent):
+        self.after(0, lambda: self.progress_var.set(percent))
+
+    def queue_stage(self, stage_name):
+        self.after(0, lambda: self.stage_label.config(text=stage_name))
+
+    def queue_download_finished(self):
+        self.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
+
+    def check_thread(self):
+        if self.download_thread and self.download_thread.is_alive():
+            self.after(100, self.check_thread)
+        else:
+            self.download_btn.config(state=tk.NORMAL)
+
+    def setup_links_tab(self):
+        frame = ttk.Frame(self.links_tab, padding=30)
+        frame.pack(fill=tk.BOTH, expand=True)
+        btn_style = {"width": 45, "padding": 12}
+        ttk.Button(frame, text="📋 SteamCMD Compatibility List (by Jarvis)",
+                   command=lambda: webbrowser.open("https://docs.google.com/spreadsheets/d/1QM33bJh1cGNTfUEc4VeuCOJXxpFFiTMfI24Rh_u-BCI/edit?gid=1002118274#gid=1002118274"),
+                   **btn_style).pack(pady=12)
+        ttk.Button(frame, text="🐧 Linux PC Game Compatibility List (by Taffer)",
+                   command=lambda: webbrowser.open("https://docs.google.com/spreadsheets/d/1xfhXZ5iFXGwrajG9zRxsmYBxsLsZfIhwDlhVFwCPQGY/edit?gid=2139941926#gid=2139941926"),
+                   **btn_style).pack(pady=12)
+        ttk.Button(frame, text="🪟 Windows PC Game Compatibility List (by Taffer)",
+                   command=lambda: webbrowser.open("https://docs.google.com/spreadsheets/d/1xfhXZ5iFXGwrajG9zRxsmYBxsLsZfIhwDlhVFwCPQGY/edit?gid=781332700#gid=781332700"),
+                   **btn_style).pack(pady=12)
+
+    def setup_about_tab(self):
+        frame = ttk.Frame(self.about_tab)
+        frame.pack(fill=tk.BOTH, expand=True)
+        center = ttk.Frame(frame)
+        center.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        ttk.Label(center, text="🎮 NintenDeck SteamCMD Tool 🎮", font=("Arial", 24, "bold")).pack(pady=15)
+        ttk.Label(center, text="Steam Deck style with Joy‑Con red/blue accents", font=("Arial", 12)).pack(pady=5)
+        ttk.Label(center, text="\nCredits:\nAzkali for original wrapper\nTaffer for spreadsheets\nValve for SteamCMD\nDeepSeek for vibecoding",
+                  justify=tk.CENTER, font=("Arial", 11)).pack(pady=20)
+
+if __name__ == "__main__":
+    app = SteamGUI()
+    app.mainloop()

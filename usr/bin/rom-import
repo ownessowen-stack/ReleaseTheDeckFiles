@@ -1,0 +1,1065 @@
+#!/usr/bin/env python3
+"""
+Pegasus ROM Importer - NintenDeck Edition
+- Settings button to manually set emulator commands
+- Full touch-optimised file selector
+- Dark theme with Joy-Con colors
+"""
+
+import os
+import re
+import io
+import time
+import shutil
+import configparser
+import subprocess
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from threading import Thread
+from pathlib import Path
+from PIL import Image, ImageTk
+import requests
+from steamgrid import SteamGridDB
+
+# ================= UI DIMENSIONS =================
+WIN_W = 950
+WIN_H = 700
+FONT_SIZE = 10
+PAD = 6
+BTN_WIDTH = 12
+CANVAS_H = 300
+SCROLLBAR_W = 16
+TILE_WIDTH = 200
+TILE_HEIGHT = 310
+# ================================================
+
+EMULATORS = {
+    'Nintendo 3DS': 'azahar -f "{file.path}"',
+    'Nintendo GameCube': 'dolphin-emu -b -e "{file.path}"',
+    'Nintendo Wii': 'dolphin-emu -b -e "{file.path}"',
+    'Nintendo Wii U': 'cemu -f -g "{file.path}"',
+    'PlayStation': 'duckstation-qt -fullscreen "{file.path}"',
+    'PlayStation 2': 'aethersx2-qt --fullscreen "{file.path}"',
+    'PlayStation 3': 'rpcs3 --fullscreen --no-gui "{file.path}"',
+    'PlayStation Portable': 'ppsspp-qt --fullscreen --escape-exit "{file.path}"',
+    'PS Vita': 'Vita3K --fullscreen "{file.path}"',
+    'Xbox': 'xemu -full-screen -disk "{file.path}"',
+    'Sega Dreamcast': 'flycast --fullscreen --exit "{file.path}"',
+    'Nintendo DS': 'melonDS -f "{file.path}"',
+    'Game Boy Advance': 'mGBA-qt -f "{file.path}"',
+    'Unknown': 'echo "No emulator configured for this platform"',
+}
+
+EXTENSION_MAP = {
+    '.3ds': ('Nintendo 3DS', EMULATORS['Nintendo 3DS']),
+    '.cia': ('Nintendo 3DS (CIA)', EMULATORS['Nintendo 3DS']),
+    '.3dsx': ('Nintendo 3DS', EMULATORS['Nintendo 3DS']),
+    '.gcm': ('Nintendo GameCube', EMULATORS['Nintendo GameCube']),
+    '.gcz': ('Nintendo GameCube', EMULATORS['Nintendo GameCube']),
+    '.wbfs': ('Nintendo Wii', EMULATORS['Nintendo Wii']),
+    '.rvz': ('Nintendo Wii', EMULATORS['Nintendo Wii']),
+    '.wia': ('Nintendo Wii', EMULATORS['Nintendo Wii']),
+    '.wua': ('Nintendo Wii U', EMULATORS['Nintendo Wii U']),
+    '.wud': ('Nintendo Wii U', EMULATORS['Nintendo Wii U']),
+    '.wux': ('Nintendo Wii U', EMULATORS['Nintendo Wii U']),
+    '.rpx': ('Nintendo Wii U', EMULATORS['Nintendo Wii U']),
+    '.cue': ('PlayStation', EMULATORS['PlayStation']),
+    '.chd': ('PlayStation', EMULATORS['PlayStation']),
+    '.pbp': ('PlayStation', EMULATORS['PlayStation']),
+    '.ps3': ('PlayStation 3', EMULATORS['PlayStation 3']),
+    '.elf': ('PlayStation 3', EMULATORS['PlayStation 3']),
+    '.cso': ('PlayStation Portable', EMULATORS['PlayStation Portable']),
+    '.vpk': ('PS Vita', EMULATORS['PS Vita']),
+    '.pkg': ('PS Vita', EMULATORS['PS Vita']),
+    '.xbe': ('Xbox', EMULATORS['Xbox']),
+    '.gdi': ('Sega Dreamcast', EMULATORS['Sega Dreamcast']),
+    '.cdi': ('Sega Dreamcast', EMULATORS['Sega Dreamcast']),
+    '.nds': ('Nintendo DS', EMULATORS['Nintendo DS']),
+    '.gba': ('Game Boy Advance', EMULATORS['Game Boy Advance']),
+    '.iso': ('Unknown', EMULATORS['Unknown']),
+    '.bin': ('Unknown', EMULATORS['Unknown']),
+}
+
+SUPPORTED_EXTENSIONS = [
+    '.3ds', '.cia', '.3dsx', '.gcm', '.gcz', '.wbfs', '.rvz', '.wia', '.wua',
+    '.wud', '.wux', '.rpx', '.cue', '.chd', '.pbp', '.ps3', '.elf', '.cso',
+    '.vpk', '.pkg', '.xbe', '.gdi', '.cdi', '.nds', '.gba', '.iso', '.bin'
+]
+
+CONFIG_FILE = Path.home() / '.pegasus_importer.ini'
+ROM_BASE_DIR = Path.home() / 'Game ROMs'
+TEMP_DIR = Path.home() / '.pegasus_temp'
+
+def clean_game_title(filename):
+    name = os.path.splitext(filename)[0]
+    patterns = [
+        r'\s*\([^)]*?(?:USA|Europe|Japan|World|Germany|France|Spain|Italy|Australia|Brazil|Asia|Korea|China)[^)]*?\)',
+        r'\s*\(Rev\s*\d+\)',
+        r'\s*\(v[\d\.]+\)',
+        r'\s*\[h[^\]]*\]',
+        r'\s*\[t[^\]]*\]',
+        r'\s*\[!\]',
+        r'\s*\(\d+\)',
+        r'\s*\([A-Za-z]{2}(?:,[A-Za-z]{2})*\)',
+        r'\s*\([^)]*,[^)]*\)',
+        r'\s*-\s*$',
+        r'\s+$',
+    ]
+    for pat in patterns:
+        name = re.sub(pat, '', name, flags=re.IGNORECASE)
+    name = name.replace('_', ' ').replace('.', ' ')
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name
+
+def get_pegasus_config_dir():
+    flatpak = Path.home() / ".var/app/org.pegasus_frontend.Pegasus/config/pegasus-frontend"
+    if flatpak.exists() or flatpak.parent.exists():
+        return flatpak
+    standard = Path.home() / ".config/pegasus-frontend"
+    if standard.exists() or standard.parent.exists():
+        return standard
+    standard.mkdir(parents=True, exist_ok=True)
+    return standard
+
+def add_rom_directory_to_pegasus(rom_dir):
+    config_dir = get_pegasus_config_dir()
+    game_dirs_file = config_dir / "game_dirs.txt"
+    rom_dir_str = str(rom_dir.resolve())
+    existing = []
+    if game_dirs_file.exists():
+        with open(game_dirs_file, 'r') as f:
+            existing = [line.strip() for line in f if line.strip()]
+    if rom_dir_str not in existing:
+        with open(game_dirs_file, 'a') as f:
+            f.write(rom_dir_str + '\n')
+        return True
+    return False
+
+class GameTile:
+    def __init__(self, rom_path, platform, title):
+        self.rom_path = Path(rom_path)
+        self.platform = platform
+        self.title = title
+        self.current_art_url = None
+        self.pending_title = None
+        self.pending_art_url = None
+        self.pending_temp_art_path = None
+        self.pending_platform = None
+
+    def has_pending_changes(self):
+        return (self.pending_title is not None and self.pending_title != self.title) or \
+               (self.pending_art_url is not None and self.pending_art_url != self.current_art_url) or \
+               (self.pending_platform is not None and self.pending_platform != self.platform)
+
+class PegasusImporter:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Pegasus ROM Importer - NintenDeck")
+        self.root.geometry(f"{WIN_W}x{WIN_H}")
+        self.root.minsize(800, 600)
+        self.root.configure(bg='#1e1e1e')
+
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self.setup_styles()
+        self.root.option_add('*Font', ('TkDefaultFont', FONT_SIZE))
+
+        self.sgdb = None
+        self.games = []
+        self.game_tile_widgets = []
+        self.status_label = None
+        self.unsaved_changes = False
+        self.custom_commands = {}
+
+        TEMP_DIR.mkdir(exist_ok=True)
+
+        self.load_api_key()
+        self.load_custom_commands()
+        self.create_widgets()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def setup_styles(self):
+        self.style.configure('TFrame', background='#1e1e1e', borderwidth=0, relief='flat')
+        self.style.configure('TLabel', background='#1e1e1e', foreground='#ffffff')
+        self.style.configure('TCheckbutton', background='#1e1e1e', foreground='#ffffff')
+        self.style.configure('TSeparator', background='#555555')
+        self.style.configure('TButton', background='#3a3a3a', foreground='#ffffff', borderwidth=1, focusthickness=0)
+        self.style.map('TButton', background=[('active', '#00aeef'), ('pressed', '#e60012')])
+        self.style.configure('Accent.TButton', background='#00aeef', foreground='#ffffff')
+        self.style.configure('Red.TButton', background='#e60012', foreground='#ffffff')
+        self.style.configure('TEntry', fieldbackground='#2a2a2a', foreground='#ffffff', bordercolor='#2a2a2a', lightcolor='#2a2a2a', borderwidth=1)
+        self.style.configure('TCombobox', fieldbackground='#2a2a2a', foreground='#ffffff', bordercolor='#2a2a2a', arrowcolor='#ffffff')
+        self.style.configure('TText', background='#2a2a2a', foreground='#ffffff', borderwidth=0, highlightthickness=0)
+        self.style.configure('TCanvas', background='#2a2a2a')
+        self.style.configure("Touch.Vertical.TScrollbar", arrowsize=16, gripcount=0, width=SCROLLBAR_W, background='#2a2a2a', troughcolor='#1e1e1e')
+        self.style.configure("Touch.Horizontal.TScrollbar", arrowsize=16, gripcount=0, width=SCROLLBAR_W, background='#2a2a2a', troughcolor='#1e1e1e')
+        self.style.configure("Vertical.TScrollbar", background='#2a2a2a', troughcolor='#1e1e1e', arrowcolor='#ffffff', width=SCROLLBAR_W)
+        self.style.configure("Horizontal.TScrollbar", background='#2a2a2a', troughcolor='#1e1e1e', arrowcolor='#ffffff', width=SCROLLBAR_W)
+
+    def load_api_key(self):
+        config = configparser.ConfigParser()
+        if CONFIG_FILE.exists():
+            config.read(CONFIG_FILE)
+            key = config.get('steamgriddb', 'api_key', fallback='')
+            if key:
+                self.sgdb = SteamGridDB(key)
+
+    def save_api_key(self, key):
+        config = configparser.ConfigParser()
+        config['steamgriddb'] = {'api_key': key}
+        with open(CONFIG_FILE, 'w') as f:
+            config.write(f)
+        self.sgdb = SteamGridDB(key)
+
+    def load_custom_commands(self):
+        config = configparser.ConfigParser()
+        if CONFIG_FILE.exists():
+            config.read(CONFIG_FILE)
+            if config.has_section('custom_commands'):
+                for platform, cmd in config.items('custom_commands'):
+                    self.custom_commands[platform] = cmd
+
+    def save_custom_command(self, platform, command):
+        config = configparser.ConfigParser()
+        if CONFIG_FILE.exists():
+            config.read(CONFIG_FILE)
+        if not config.has_section('custom_commands'):
+            config.add_section('custom_commands')
+        config.set('custom_commands', platform, command)
+        with open(CONFIG_FILE, 'w') as f:
+            config.write(f)
+        self.custom_commands[platform] = command
+
+    def open_settings(self):
+        settings = tk.Toplevel(self.root)
+        settings.title("Emulator Settings")
+        settings.geometry("500x400")
+        settings.configure(bg='#1e1e1e')
+        settings.transient(self.root)
+        settings.grab_set()
+
+        ttk.Label(settings, text="Custom Emulator Commands", font=('TkDefaultFont', 12, 'bold')).pack(pady=10)
+
+        frame = ttk.Frame(settings)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        canvas = tk.Canvas(frame, bg='#1e1e1e')
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable = ttk.Frame(canvas)
+        scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0), window=scrollable, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        platforms = [p for p in EMULATORS.keys() if p != 'Unknown']
+        entries = {}
+        for platform in platforms:
+            row = ttk.Frame(scrollable)
+            row.pack(fill=tk.X, pady=5)
+            ttk.Label(row, text=platform, width=20).pack(side=tk.LEFT, padx=5)
+            var = tk.StringVar(value=self.custom_commands.get(platform, ''))
+            entry = ttk.Entry(row, textvariable=var, width=40)
+            entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            entries[platform] = var
+            ttk.Button(row, text="Default", command=lambda p=platform, v=var: v.set(EMULATORS[p])).pack(side=tk.LEFT, padx=2)
+            ttk.Button(row, text="Test", command=lambda p=platform, v=var: self.test_command(p, v.get())).pack(side=tk.LEFT, padx=2)
+
+        def save():
+            for platform, var in entries.items():
+                cmd = var.get().strip()
+                if cmd and cmd != EMULATORS.get(platform, ''):
+                    self.save_custom_command(platform, cmd)
+                elif cmd == '':
+                    config = configparser.ConfigParser()
+                    if CONFIG_FILE.exists():
+                        config.read(CONFIG_FILE)
+                    if config.has_section('custom_commands') and config.has_option('custom_commands', platform):
+                        config.remove_option('custom_commands', platform)
+                        with open(CONFIG_FILE, 'w') as f:
+                            config.write(f)
+                        if platform in self.custom_commands:
+                            del self.custom_commands[platform]
+            messagebox.showinfo("Settings", "Custom commands saved.")
+            settings.destroy()
+
+        ttk.Button(settings, text="Save", command=save).pack(pady=10)
+
+    def test_command(self, platform, command):
+        if not command:
+            messagebox.showerror("Test", "No command entered.")
+            return
+        test_cmd = command.replace("{file.path}", "/tmp/dummy.rom")
+        try:
+            result = subprocess.run(test_cmd.split(), capture_output=True, text=True, timeout=5)
+            messagebox.showinfo("Test Result", f"Command executed.\nReturn code: {result.returncode}\n{result.stdout[:200]}")
+        except Exception as e:
+            messagebox.showerror("Test Failed", str(e))
+
+    def create_widgets(self):
+        main = ttk.Frame(self.root, padding=PAD)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        top_frame = ttk.Frame(main)
+        top_frame.pack(fill=tk.X, pady=PAD)
+        ttk.Button(top_frame, text="Set SteamGridDB API Key", command=self.set_api_key, width=22).pack(side=tk.LEFT, padx=PAD)
+        ttk.Button(top_frame, text="Select Files", command=self.open_touch_file_selector, width=12).pack(side=tk.LEFT, padx=PAD)
+        ttk.Button(top_frame, text="Save Changes", command=self.save_all_changes, width=12).pack(side=tk.LEFT, padx=PAD)
+        ttk.Button(top_frame, text="Settings", command=self.open_settings, width=10).pack(side=tk.LEFT, padx=PAD)
+        ttk.Button(top_frame, text="Refresh View", command=self.refresh_grid, width=12).pack(side=tk.LEFT, padx=PAD)
+
+        ttk.Label(main, text="Imported Games (click artwork to change, click 'Edit Title' or 'Edit Console' to modify):",
+                  font=('TkDefaultFont', FONT_SIZE, 'bold')).pack(anchor=tk.W, pady=(PAD,0))
+
+        canvas_frame = ttk.Frame(main)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, pady=PAD)
+        self.canvas = tk.Canvas(canvas_frame, height=CANVAS_H, bg='#2a2a2a', highlightthickness=0)
+        v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        v_scroll.config(style="Touch.Vertical.TScrollbar")
+        h_scroll.config(style="Touch.Horizontal.TScrollbar")
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
+        self.canvas.bind("<Button-4>", self._on_mousewheel_linux)
+        self.canvas.bind("<Button-5>", self._on_mousewheel_linux)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+        self.inner_frame = ttk.Frame(self.canvas)
+        self.canvas.create_window((0,0), window=self.inner_frame, anchor=tk.NW)
+        self.inner_frame.bind("<Configure>", self._on_frame_configure)
+
+        self.status_label = ttk.Label(main, text="", foreground="#00aeef", font=('TkDefaultFont', 9))
+        self.status_label.pack(pady=PAD)
+
+    # --- scrolling methods ---
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    def _on_shift_mousewheel(self, event):
+        self.canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+    def _on_mousewheel_linux(self, event):
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+    def _on_frame_configure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    def _on_canvas_resize(self, event):
+        self.relayout_tiles()
+
+    def get_tile_columns(self):
+        canvas_width = self.canvas.winfo_width()
+        if canvas_width <= 0:
+            return 3
+        return max(1, canvas_width // (TILE_WIDTH + 2*PAD))
+
+    def relayout_tiles(self):
+        if not self.game_tile_widgets:
+            return
+        cols = self.get_tile_columns()
+        for idx, (frame, game) in enumerate(self.game_tile_widgets):
+            row = idx // cols
+            col = idx % cols
+            frame.grid(row=row, column=col, padx=PAD, pady=PAD, sticky="n")
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def set_api_key(self):
+        key = simpledialog.askstring("SteamGridDB API Key", "Enter your API key from https://www.steamgriddb.com/profile/preferences/api", show='*')
+        if key:
+            self.save_api_key(key)
+            messagebox.showinfo("Success", "API key saved.")
+
+    # ------------------------------------------------------------
+    # TOUCH FILE SELECTOR
+    # ------------------------------------------------------------
+    def open_touch_file_selector(self):
+        selector = tk.Toplevel(self.root)
+        selector.title("Select ROM Files")
+        selector.geometry("800x500")
+        selector.configure(bg='#1e1e1e')
+        selector.transient(self.root)
+        selector.grab_set()
+
+        top_frame = ttk.Frame(selector, padding=5)
+        top_frame.pack(fill=tk.X)
+        ttk.Label(top_frame, text="Folder:").pack(side=tk.LEFT, padx=5)
+        self.current_dir = tk.StringVar(value=str(Path.home()))
+        dir_entry = ttk.Entry(top_frame, textvariable=self.current_dir, width=50)
+        dir_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(top_frame, text="Parent", command=lambda: self.go_parent(selector)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="Browse...", command=lambda: self.choose_folder(selector)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="Refresh", command=lambda: self.populate_file_list_with_checkboxes()).pack(side=tk.LEFT, padx=5)
+
+        canvas_frame = ttk.Frame(selector)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.list_canvas = tk.Canvas(canvas_frame, bg='#2a2a2a', highlightthickness=0)
+        v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.list_canvas.yview)
+        h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.list_canvas.xview)
+        self.list_canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        v_scroll.config(style="Touch.Vertical.TScrollbar")
+        h_scroll.config(style="Touch.Horizontal.TScrollbar")
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.list_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.file_inner = ttk.Frame(self.list_canvas)
+        self.list_canvas.create_window((0,0), window=self.file_inner, anchor=tk.NW, width=self.list_canvas.winfo_width())
+        self.file_inner.bind("<Configure>", lambda e: self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all")))
+        self.list_canvas.bind("<Configure>", lambda e: self.list_canvas.itemconfig(1, width=e.width))
+        self.list_canvas.bind("<MouseWheel>", self._on_list_canvas_mousewheel)
+        self.list_canvas.bind("<Shift-MouseWheel>", self._on_list_canvas_shift_mousewheel)
+        self.list_canvas.bind("<Button-4>", self._on_list_canvas_mousewheel_linux)
+        self.list_canvas.bind("<Button-5>", self._on_list_canvas_mousewheel_linux)
+        self.check_vars = {}
+        bottom_frame = ttk.Frame(selector, padding=5)
+        bottom_frame.pack(fill=tk.X)
+        ttk.Button(bottom_frame, text="Select All Files", command=self.select_all_files).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bottom_frame, text="Clear All", command=self.clear_all_selection).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bottom_frame, text="Import Selected", command=lambda: self.import_selected_with_checkboxes(selector)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bottom_frame, text="Cancel", command=selector.destroy).pack(side=tk.RIGHT, padx=5)
+        self.populate_file_list_with_checkboxes()
+
+    def _on_list_canvas_mousewheel(self, event):
+        self.list_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    def _on_list_canvas_shift_mousewheel(self, event):
+        self.list_canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+    def _on_list_canvas_mousewheel_linux(self, event):
+        if event.num == 4:
+            self.list_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.list_canvas.yview_scroll(1, "units")
+
+    def go_parent(self, selector):
+        path = Path(self.current_dir.get())
+        self.current_dir.set(str(path.parent))
+        self.populate_file_list_with_checkboxes()
+
+    def choose_folder(self, selector):
+        folder = filedialog.askdirectory(title="Select folder containing ROMs")
+        if folder:
+            self.current_dir.set(folder)
+            self.populate_file_list_with_checkboxes()
+
+    def populate_file_list_with_checkboxes(self):
+        for widget in self.file_inner.winfo_children():
+            widget.destroy()
+        self.check_vars.clear()
+        dir_path = Path(self.current_dir.get())
+        if not dir_path.exists():
+            return
+        items = []
+        for item in sorted(dir_path.iterdir()):
+            if item.is_dir():
+                items.append(("📁 " + item.name, str(item), True))
+        for item in sorted(dir_path.iterdir()):
+            if item.is_file() and item.suffix.lower() in SUPPORTED_EXTENSIONS:
+                items.append(("📄 " + item.name, str(item), False))
+        for idx, (display, full_path, is_folder) in enumerate(items):
+            if idx > 0:
+                sep = tk.Frame(self.file_inner, height=2, bg='#555555')
+                sep.pack(fill=tk.X, pady=2)
+            row_frame = ttk.Frame(self.file_inner)
+            row_frame.pack(fill=tk.X, pady=2, padx=5)
+            row_frame.columnconfigure(1, weight=1)
+            if not is_folder:
+                var = tk.BooleanVar()
+                cb = ttk.Checkbutton(row_frame, variable=var)
+                cb.grid(row=0, column=0, padx=5, sticky='w')
+                self.check_vars[full_path] = var
+            else:
+                ttk.Label(row_frame, width=2).grid(row=0, column=0, padx=5)
+            label = ttk.Label(row_frame, text=display, font=('TkDefaultFont', 11))
+            label.grid(row=0, column=1, padx=5, sticky='w')
+            if is_folder:
+                def enter_cb(event, p=full_path):
+                    self.enter_folder(p)
+                label.bind("<Button-1>", enter_cb)
+                row_frame.bind("<Button-1>", enter_cb)
+            else:
+                def toggle_cb(event, fp=full_path):
+                    if fp in self.check_vars:
+                        self.check_vars[fp].set(not self.check_vars[fp].get())
+                label.bind("<Button-1>", toggle_cb)
+                row_frame.bind("<Button-1>", toggle_cb)
+        self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all"))
+        self.list_canvas.yview_moveto(0)
+
+    def enter_folder(self, folder_path):
+        self.current_dir.set(folder_path)
+        self.populate_file_list_with_checkboxes()
+
+    def select_all_files(self):
+        for var in self.check_vars.values():
+            var.set(True)
+
+    def clear_all_selection(self):
+        for var in self.check_vars.values():
+            var.set(False)
+
+    def import_selected_with_checkboxes(self, selector):
+        files = [path for path, var in self.check_vars.items() if var.get()]
+        if not files:
+            messagebox.showinfo("No Selection", "Please select some ROM files first.")
+            return
+        selector.destroy()
+        self._process_rom_files(files)
+
+    # ------------------------------------------------------------
+    # BATCH IMPORT
+    # ------------------------------------------------------------
+    def _process_rom_files(self, files):
+        if not files:
+            return
+        for child in self.root.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for btn in child.winfo_children():
+                    if isinstance(btn, ttk.Button) and btn['text'] in ("Select Files",):
+                        btn.config(state=tk.DISABLED)
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Importing ROMs")
+        progress_win.geometry("500x150")
+        progress_win.configure(bg='#1e1e1e')
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        ttk.Label(progress_win, text="Importing ROMs...", font=('TkDefaultFont', 12)).pack(pady=10)
+        progress_bar = ttk.Progressbar(progress_win, length=400, mode='determinate')
+        progress_bar.pack(pady=10)
+        status_label = ttk.Label(progress_win, text="Starting...")
+        status_label.pack(pady=5)
+
+        def worker():
+            total = len(files)
+            new_games = []
+            for i, rom_file in enumerate(files):
+                progress_bar['value'] = i / total * 100
+                status_label.config(text=f"Processing {i+1}/{total}: {os.path.basename(rom_file)}")
+                progress_win.update_idletasks()
+                try:
+                    ext = os.path.splitext(rom_file)[1].lower()
+                    if ext not in EXTENSION_MAP:
+                        continue
+                    platform, _ = EXTENSION_MAP[ext]
+                    title = clean_game_title(os.path.basename(rom_file))
+                    target_dir = ROM_BASE_DIR / platform
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    dest = target_dir / Path(rom_file).name
+                    if dest != Path(rom_file):
+                        shutil.move(rom_file, dest)
+                    assets = {}
+                    grid_url = None
+                    try:
+                        games = self.sgdb.search_game(title)
+                        if games:
+                            game_id = games[0].id
+                            grids = self.sgdb.get_grids_by_gameid([game_id])
+                            if grids:
+                                assets['grid'] = grids[0].url
+                                grid_url = grids[0].url
+                            logos = self.sgdb.get_logos_by_gameid([game_id])
+                            if logos:
+                                assets['logo'] = logos[0].url
+                            heroes = self.sgdb.get_heroes_by_gameid([game_id])
+                            if heroes:
+                                assets['hero'] = heroes[0].url
+                    except:
+                        pass
+                    self._write_metadata_for_rom(dest, platform, title, assets)
+                    add_rom_directory_to_pegasus(target_dir)
+                    tile = GameTile(dest, platform, title)
+                    tile.current_art_url = grid_url
+                    new_games.append(tile)
+                except Exception as e:
+                    print(f"Error with {rom_file}: {e}")
+            progress_bar['value'] = 100
+            status_label.config(text="Complete!")
+            progress_win.after(1000, progress_win.destroy)
+            self.root.after(0, lambda: self.add_games_to_grid(new_games))
+            self.root.after(0, lambda: self._reenable_import_buttons())
+        Thread(target=worker, daemon=True).start()
+
+    def _reenable_import_buttons(self):
+        for child in self.root.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for btn in child.winfo_children():
+                    if isinstance(btn, ttk.Button) and btn['text'] in ("Select Files",):
+                        btn.config(state=tk.NORMAL)
+
+    # ------------------------------------------------------------
+    # METADATA WRITING (with custom command support)
+    # ------------------------------------------------------------
+    def _write_metadata_for_rom(self, rom_path, platform, title, assets):
+        rom_dir = Path(rom_path).parent
+        metadata_path = rom_dir / "metadata.pegasus.txt"
+        media_root = rom_dir / "media"
+        boxart_dir = media_root / "box2dfront"
+        logo_dir = media_root / "wheel"
+        hero_dir = media_root / "fanart"
+        for d in [boxart_dir, logo_dir, hero_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        asset_lines = []
+        for atype, url in assets.items():
+            if atype == 'grid':
+                subfolder = boxart_dir
+                key = 'assets.box_front'
+            elif atype == 'logo':
+                subfolder = logo_dir
+                key = 'assets.logo'
+            elif atype == 'hero':
+                subfolder = hero_dir
+                key = 'assets.fanart'
+            else:
+                continue
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                ext = url.split('.')[-1].split('?')[0]
+                if ext.lower() not in ['png','jpg','jpeg']:
+                    ext = 'png'
+                filename = f"{self.sanitize_filename(title)}.{ext}"
+                filepath = subfolder / filename
+                with open(filepath, 'wb') as f:
+                    f.write(resp.content)
+                rel_path = os.path.relpath(filepath, rom_dir)
+                asset_lines.append(f"{key}: {rel_path}")
+            except Exception as e:
+                print(f"Failed {atype}: {e}")
+
+        launch_cmd = self.get_launch_command(platform, str(rom_path))
+        rom_filename = os.path.basename(rom_path)
+        extension = os.path.splitext(rom_path)[1][1:]
+
+        collection_header = f"collection: {platform}\nextension: {extension}\nlaunch: {launch_cmd}\n\n"
+        game_block = f"game: {title}\nfile: {rom_filename}\ndeveloper: \ndescription: \n" + "\n".join(asset_lines) + "\n\n"
+
+        if not metadata_path.exists():
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                f.write(collection_header + game_block)
+            return
+
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        pattern = re.compile(rf'^game:.*?\nfile: {re.escape(rom_filename)}\n.*?(?=\n\ngame:|\Z)', re.MULTILINE | re.DOTALL)
+        existing_match = pattern.search(content)
+        if existing_match:
+            new_content = content.replace(existing_match.group(0), game_block.rstrip())
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            return
+
+        header_pattern = re.compile(rf'^collection: {re.escape(platform)}\n', re.MULTILINE)
+        if header_pattern.search(content):
+            with open(metadata_path, 'a', encoding='utf-8') as f:
+                if not content.endswith('\n\n'):
+                    f.write('\n')
+                f.write(game_block)
+        else:
+            with open(metadata_path, 'a', encoding='utf-8') as f:
+                if not content.endswith('\n\n'):
+                    f.write('\n')
+                f.write(collection_header + game_block)
+
+    # ------------------------------------------------------------
+    # GRID MANAGEMENT
+    # ------------------------------------------------------------
+    def add_games_to_grid(self, new_games):
+        self.games.extend(new_games)
+        self.refresh_grid()
+        self.unsaved_changes = False
+
+    def refresh_grid(self):
+        for w in self.inner_frame.winfo_children():
+            w.destroy()
+        self.game_tile_widgets.clear()
+        for game in self.games:
+            tile_frame = self.create_tile(game)
+            self.game_tile_widgets.append((tile_frame, game))
+        self.relayout_tiles()
+
+    def create_tile(self, game):
+        tile = ttk.Frame(self.inner_frame, relief=tk.RIDGE, borderwidth=2, width=TILE_WIDTH, height=TILE_HEIGHT)
+        tile.pack_propagate(False)
+        rom_dir = game.rom_path.parent
+        if game.pending_temp_art_path and game.pending_temp_art_path.exists():
+            boxart_path = game.pending_temp_art_path
+        else:
+            boxart_path = rom_dir / "media/box2dfront" / f"{self.sanitize_filename(game.title)}.png"
+            if not boxart_path.exists():
+                boxart_path = rom_dir / "media/box2dfront" / f"{self.sanitize_filename(game.title)}.jpg"
+        if boxart_path.exists():
+            try:
+                img = Image.open(boxart_path)
+                img.thumbnail((180, 180))
+                photo = ImageTk.PhotoImage(img)
+                art_btn = ttk.Button(tile, image=photo, command=lambda g=game: self.change_artwork(g))
+                art_btn.image = photo
+                art_btn.pack(pady=5)
+            except:
+                art_btn = ttk.Button(tile, text="No art", command=lambda g=game: self.change_artwork(g), width=20)
+                art_btn.pack(pady=5)
+        else:
+            art_btn = ttk.Button(tile, text="No art", command=lambda g=game: self.change_artwork(g), width=20)
+            art_btn.pack(pady=5)
+
+        title_frame = ttk.Frame(tile)
+        title_frame.pack(fill=tk.X, pady=2)
+        display_title = game.pending_title if game.pending_title is not None else game.title
+        title_label = ttk.Label(title_frame, text=display_title, wraplength=TILE_WIDTH-40, font=('TkDefaultFont', 9, 'bold'))
+        title_label.pack(side=tk.LEFT, padx=5)
+        edit_btn = ttk.Button(title_frame, text="✎", width=2, command=lambda g=game: self.edit_title(g))
+        edit_btn.pack(side=tk.RIGHT, padx=5)
+
+        platform_frame = ttk.Frame(tile)
+        platform_frame.pack(fill=tk.X, pady=2)
+        display_platform = game.pending_platform if game.pending_platform is not None else game.platform
+        platform_label = ttk.Label(platform_frame, text=display_platform, font=('TkDefaultFont', 8))
+        platform_label.pack(side=tk.LEFT, padx=5)
+        edit_console_btn = ttk.Button(platform_frame, text="Edit Console", width=10, command=lambda g=game: self.edit_console(g))
+        edit_console_btn.pack(side=tk.RIGHT, padx=5)
+
+        hint_label = ttk.Label(tile, text="Click art to change", font=('TkDefaultFont', 7), foreground="gray")
+        hint_label.pack(pady=2)
+        return tile
+
+    def edit_title(self, game):
+        current = game.pending_title if game.pending_title is not None else game.title
+        new_title = simpledialog.askstring("Edit Title", f"Enter new title for {current}:", initialvalue=current)
+        if new_title and new_title != current:
+            game.pending_title = new_title
+            self.unsaved_changes = True
+            self.refresh_game_tile(game)
+            self.status_label.config(text=f"Title changed to '{new_title}' (not saved yet)")
+            self.root.after(2000, lambda: self.status_label.config(text=""))
+
+    def edit_console(self, game):
+        platforms = sorted(EMULATORS.keys())
+        current = game.pending_platform if game.pending_platform is not None else game.platform
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Select Console")
+        dialog.geometry("300x400")
+        dialog.configure(bg='#1e1e1e')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Choose platform:", font=('TkDefaultFont', 12)).pack(pady=10)
+        listbox = tk.Listbox(dialog, selectmode=tk.SINGLE, bg='#2a2a2a', fg='#ffffff', selectbackground='#00aeef')
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        for p in platforms:
+            listbox.insert(tk.END, p)
+        if current in platforms:
+            listbox.selection_set(platforms.index(current))
+        def confirm():
+            sel = listbox.curselection()
+            if sel:
+                new_platform = platforms[sel[0]]
+                if new_platform != current:
+                    game.pending_platform = new_platform
+                    self.unsaved_changes = True
+                    self.refresh_game_tile(game)
+                    self.status_label.config(text=f"Console changed to {new_platform} (not saved yet)")
+                    self.root.after(2000, lambda: self.status_label.config(text=""))
+            dialog.destroy()
+        ttk.Button(dialog, text="OK", command=confirm).pack(pady=10)
+
+    def change_artwork(self, game):
+        if not self.sgdb:
+            messagebox.showerror("No API Key", "API key required.")
+            return
+        self.status_label.config(text=f"Fetching artwork for {game.title}...")
+        self.root.update_idletasks()
+        popup = tk.Toplevel(self.root)
+        popup.title(f"Change Artwork - {game.title}")
+        popup.geometry("800x600")
+        popup.configure(bg='#1e1e1e')
+        popup.transient(self.root)
+        frame = ttk.Frame(popup, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, bg='#2a2a2a')
+        v_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
+        h_scroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set, bg='#2a2a2a')
+        v_scroll.config(style="Touch.Vertical.TScrollbar")
+        h_scroll.config(style="Touch.Horizontal.TScrollbar")
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0,0), window=inner, anchor=tk.NW)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        loading = ttk.Label(popup, text="Fetching artwork...", foreground="#00aeef")
+        loading.pack(pady=5)
+        popup.update()
+
+        def fetch_and_display():
+            try:
+                games = self.sgdb.search_game(game.title)
+                if not games:
+                    popup.after(0, lambda: messagebox.showerror("Error", f"No game found for '{game.title}'"))
+                    popup.destroy()
+                    self.status_label.config(text="")
+                    return
+                game_id = games[0].id
+                grids = self.sgdb.get_grids_by_gameid([game_id])
+                logos = self.sgdb.get_logos_by_gameid([game_id])
+                heroes = self.sgdb.get_heroes_by_gameid([game_id])
+                all_assets = []
+                for g in grids:
+                    if hasattr(g, 'thumbnail') and g.thumbnail:
+                        all_assets.append(('grid', g.url, g.thumbnail))
+                for l in logos:
+                    if hasattr(l, 'thumbnail') and l.thumbnail:
+                        all_assets.append(('logo', l.url, l.thumbnail))
+                for h in heroes:
+                    if hasattr(h, 'thumbnail') and h.thumbnail:
+                        all_assets.append(('hero', h.url, h.thumbnail))
+                if not all_assets:
+                    popup.after(0, lambda: messagebox.showinfo("No Artwork", "No images found."))
+                    popup.destroy()
+                    self.status_label.config(text="")
+                    return
+                popup.after(0, lambda: loading.destroy())
+                display_thumbnails_incrementally(all_assets, canvas, inner, popup)
+            except Exception as e:
+                popup.after(0, lambda: messagebox.showerror("Error", str(e)))
+                popup.destroy()
+                self.status_label.config(text="")
+
+        def display_thumbnails_incrementally(assets, canvas, inner, popup):
+            from queue import Queue
+            q = Queue()
+            total = len(assets)
+            progress_label = ttk.Label(popup, text=f"Downloading 0/{total} thumbnails...", foreground="#00aeef")
+            progress_label.pack(pady=5)
+
+            def download_worker():
+                for idx, (atype, url, thumb_url) in enumerate(assets):
+                    try:
+                        resp = requests.get(thumb_url, timeout=10)
+                        resp.raise_for_status()
+                        img = Image.open(io.BytesIO(resp.content))
+                        img.thumbnail((150,150))
+                        photo = ImageTk.PhotoImage(img)
+                        q.put((photo, atype, url, idx+1))
+                    except Exception as e:
+                        print(f"Failed to download thumbnail: {e}")
+                        q.put((None, None, None, idx+1))
+                q.put(None)
+
+            Thread(target=download_worker, daemon=True).start()
+            row, col = 0, 0
+            downloaded = 0
+            def process_queue():
+                nonlocal row, col, downloaded
+                try:
+                    item = q.get_nowait()
+                    if item is None:
+                        progress_label.config(text="")
+                        return
+                    photo, atype, url, idx = item
+                    downloaded += 1
+                    progress_label.config(text=f"Downloading {downloaded}/{total} thumbnails...")
+                    if photo is not None:
+                        btn = ttk.Button(inner, image=photo, text=atype.upper(), compound=tk.TOP,
+                                         command=lambda u=url, a=atype: select_and_close(u, a))
+                        btn.image = photo
+                        btn.grid(row=row, column=col, padx=5, pady=5)
+                        col += 1
+                        if col >= 4:
+                            col = 0
+                            row += 1
+                        canvas.configure(scrollregion=canvas.bbox("all"))
+                    self.root.after(100, process_queue)
+                except:
+                    self.root.after(100, process_queue)
+            self.root.after(100, process_queue)
+
+        def select_and_close(url, atype):
+            if atype == 'grid':
+                try:
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    ext = url.split('.')[-1].split('?')[0]
+                    if ext.lower() not in ['png','jpg','jpeg']:
+                        ext = 'png'
+                    temp_filename = f"temp_{game.rom_path.stem}_{int(time.time())}.{ext}"
+                    temp_path = TEMP_DIR / temp_filename
+                    with open(temp_path, 'wb') as f:
+                        f.write(resp.content)
+                    if game.pending_temp_art_path and game.pending_temp_art_path.exists():
+                        try:
+                            game.pending_temp_art_path.unlink()
+                        except:
+                            pass
+                    game.pending_art_url = url
+                    game.pending_temp_art_path = temp_path
+                    self.unsaved_changes = True
+                    self.refresh_game_tile(game)
+                    self.status_label.config(text=f"New artwork selected for {game.title} (not saved yet)")
+                    self.root.after(2000, lambda: self.status_label.config(text=""))
+                except Exception as e:
+                    print(f"Failed to download new artwork: {e}")
+                    self.status_label.config(text="Error downloading artwork")
+            popup.destroy()
+
+        Thread(target=fetch_and_display, daemon=True).start()
+
+    def refresh_game_tile(self, game):
+        for idx, (frame, g) in enumerate(self.game_tile_widgets):
+            if g == game:
+                new_frame = self.create_tile(game)
+                frame.destroy()
+                self.game_tile_widgets[idx] = (new_frame, game)
+                self.relayout_tiles()
+                break
+
+    # ------------------------------------------------------------
+    # SAVE ALL CHANGES
+    # ------------------------------------------------------------
+    def save_all_changes(self):
+        if not self.unsaved_changes:
+            messagebox.showinfo("No Changes", "There are no pending changes to save.")
+            return
+
+        pending_games = [g for g in self.games if g.has_pending_changes()]
+        total = len(pending_games)
+        if total == 0:
+            return
+
+        save_win = tk.Toplevel(self.root)
+        save_win.title("Saving Changes")
+        save_win.geometry("400x120")
+        save_win.configure(bg='#1e1e1e')
+        save_win.transient(self.root)
+        save_win.grab_set()
+        ttk.Label(save_win, text="Saving changes...", font=('TkDefaultFont', 12)).pack(pady=10)
+        progress_bar = ttk.Progressbar(save_win, length=300, mode='determinate')
+        progress_bar.pack(pady=5)
+        status_label = ttk.Label(save_win, text="")
+        status_label.pack(pady=5)
+
+        def worker():
+            for i, game in enumerate(pending_games):
+                progress_bar['value'] = i / total * 100
+                status_label.config(text=f"Saving {game.title} ({i+1}/{total})")
+                save_win.update_idletasks()
+                self._save_single_game(game)
+            progress_bar['value'] = 100
+            status_label.config(text="Complete!")
+            save_win.after(1000, save_win.destroy)
+            self.root.after(0, lambda: self._finish_save())
+        Thread(target=worker, daemon=True).start()
+
+    def _save_single_game(self, game):
+        rom_dir = game.rom_path.parent
+        metadata_path = rom_dir / "metadata.pegasus.txt"
+        if not metadata_path.exists():
+            return
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        pattern = re.compile(rf'(game: {re.escape(game.title)}\nfile: {re.escape(game.rom_path.name)}\n.*?)(?=\n\ngame:|\Z)', re.DOTALL)
+        match = pattern.search(content)
+        if not match:
+            return
+        block = match.group(1)
+        new_block = block
+
+        if game.pending_platform is not None and game.pending_platform != game.platform:
+            new_platform = game.pending_platform
+            new_dir = ROM_BASE_DIR / new_platform
+            new_dir.mkdir(parents=True, exist_ok=True)
+            new_path = new_dir / game.rom_path.name
+            if new_path != game.rom_path:
+                shutil.move(str(game.rom_path), str(new_path))
+                game.rom_path = new_path
+                game.platform = new_platform
+                game.pending_platform = None
+                self._write_metadata_for_rom(new_path, new_platform, game.title, {})
+                return
+
+        if game.pending_title is not None:
+            new_block = re.sub(r'^game: .*', f'game: {game.pending_title}', new_block, flags=re.MULTILINE)
+            game.title = game.pending_title
+            game.pending_title = None
+
+        if game.pending_art_url is not None:
+            boxart_dir = rom_dir / "media/box2dfront"
+            boxart_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if game.pending_temp_art_path and game.pending_temp_art_path.exists():
+                    ext = game.pending_art_url.split('.')[-1].split('?')[0]
+                    if ext.lower() not in ['png','jpg','jpeg']:
+                        ext = 'png'
+                    filename = f"{self.sanitize_filename(game.title)}.{ext}"
+                    filepath = boxart_dir / filename
+                    shutil.copy(game.pending_temp_art_path, filepath)
+                    if re.search(r'assets\.box_front:', new_block):
+                        new_block = re.sub(r'assets\.box_front:.*', f'assets.box_front: media/box2dfront/{filename}', new_block)
+                    else:
+                        new_block = new_block + f'\nassets.box_front: media/box2dfront/{filename}'
+                    game.current_art_url = game.pending_art_url
+                    game.pending_temp_art_path.unlink()
+            except Exception as e:
+                print(f"Failed to save artwork: {e}")
+            game.pending_art_url = None
+            game.pending_temp_art_path = None
+
+        if new_block != block:
+            new_content = content.replace(block, new_block)
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+
+    def _finish_save(self):
+        self.unsaved_changes = False
+        self.refresh_grid()
+        self.status_label.config(text="All changes saved.")
+        self.root.after(2000, lambda: self.status_label.config(text=""))
+        messagebox.showinfo("Saved", "All pending changes have been saved to disk.")
+
+    # ------------------------------------------------------------
+    # CLOSING HANDLER
+    # ------------------------------------------------------------
+    def on_closing(self):
+        if self.unsaved_changes:
+            answer = messagebox.askyesnocancel("Unsaved Changes",
+                                               "You have unsaved changes. Do you want to save them before closing?",
+                                               default=messagebox.YES)
+            if answer is True:
+                self.save_all_changes()
+                self.root.destroy()
+            elif answer is False:
+                self.root.destroy()
+        else:
+            self.root.destroy()
+        try:
+            for f in TEMP_DIR.glob("temp_*"):
+                f.unlink()
+            TEMP_DIR.rmdir()
+        except:
+            pass
+
+    # ------------------------------------------------------------
+    # GET LAUNCH COMMAND (with custom override)
+    # ------------------------------------------------------------
+    def get_launch_command(self, platform, rom_path):
+        ext = os.path.splitext(rom_path)[1].lower()
+        if ext in EXTENSION_MAP and EXTENSION_MAP[ext] is not None:
+            return EXTENSION_MAP[ext][1]
+
+        # Use custom command if set
+        if platform in self.custom_commands and self.custom_commands[platform]:
+            return self.custom_commands[platform].replace("{file.path}", rom_path)
+
+        # Default fallback
+        return EMULATORS.get(platform, 'echo "No emulator configured"')
+
+    @staticmethod
+    def sanitize_filename(name):
+        return re.sub(r'[<>:"/\\|?*]', '_', name).strip()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PegasusImporter(root)
+    root.mainloop()
